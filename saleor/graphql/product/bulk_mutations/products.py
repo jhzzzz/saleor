@@ -1,16 +1,23 @@
-from collections import defaultdict
-
+import datetime
 import graphene
-from django.core.exceptions import ValidationError
+from collections import defaultdict
+from decimal import Decimal
+from django.core.exceptions import ValidationError, ObjectDoesNotExist
 from django.db import transaction
+from django.utils.text import slugify
+from measurement.measures import Weight
 
 from ....core.permissions import ProductPermissions, ProductTypePermissions
+from ....menu import models as menu_models
 from ....order import OrderStatus, models as order_models
 from ....product import models
 from ....product.error_codes import ProductErrorCode
 from ....product.tasks import update_product_minimal_variant_price_task
+from ....product.thumbnails import create_product_images_from_url
 from ....product.utils import delete_categories
-from ....product.utils.attributes import generate_name_for_variant
+from ....product.utils.attributes import generate_name_for_variant, \
+    associate_attribute_values_to_instance
+from ....third.shopify.product import Shopify
 from ....warehouse import models as warehouse_models
 from ....warehouse.error_codes import StockErrorCode
 from ...core.mutations import (
@@ -94,6 +101,254 @@ class CollectionBulkPublish(BaseBulkMutation):
     @classmethod
     def bulk_action(cls, queryset, is_published):
         queryset.update(is_published=is_published)
+
+
+class ProductBulkCreateFromShopify(BaseMutation):
+    # for code challenge, just hard code some properties
+    DEF_PRODUCT_TYPE_ID = 16
+    DEF_PRODUCT_CATEGORY_ID = 24
+    DEF_SIZE_ATTRIBUTE_ID = 13
+    DEF_COLOR_ATTRIBUTE_ID = 14
+    DEF_WAREHOUSE_ID = "74b279b5-77a5-49d3-9ba6-789eac7a2829"
+    DEF_MENU_ITEM_ID = 20
+
+    size_color_cache = {}
+    def_warehouse_cache = None
+
+    products = graphene.Field(
+        Product, description="List of imported products."
+    )
+
+    class Arguments:
+        shop_url = graphene.String(
+            required=True,
+            description="A Shopify website URL, e.g. <SHOP-NAME>.myshopify.com"
+        )
+        access_token = graphene.String(
+            required=True,
+            description="An access token for the above website",
+        )
+        collection_id = graphene.ID(
+            required=True,
+            description="The ID of the collection to be imported",
+        )
+
+    class Meta:
+        model = models.Product
+        description = "Bulk import products from shopify collection."
+        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
+        error_type_class = ProductError
+        error_type_field = "product_errors"
+
+    @classmethod
+    def create_attribute_values(cls, attribute_id, values):
+        if attribute_id not in cls.size_color_cache:
+            attribute_cache = {
+                "attribute": models.Attribute.objects.get(pk=attribute_id),
+                "values": models.AttributeValue.objects.filter(
+                    attribute_id=attribute_id
+                )
+            }
+            cls.size_color_cache[attribute_id] = attribute_cache
+        else:
+            attribute_cache = cls.size_color_cache[attribute_id]
+
+        for val in values:
+            val = val.replace(' ', '-')  # data bug hack
+            try:
+                exist_attr_val = next(
+                    v for v in attribute_cache["values"].iterator() if v.name == val
+                )
+            except StopIteration:
+                exist_attr_val = None
+
+            if not exist_attr_val:
+                new_attribute_val = models.AttributeValue.objects.create(
+                    attribute=attribute_cache["attribute"], name=val, slug=slugify(val)
+                )
+                attribute_cache["values"] |= models.AttributeValue.objects.filter(
+                    pk=new_attribute_val.pk
+                )
+
+    @classmethod
+    def get_attribute_value(cls, attribute_id, value):
+        value = value.replace(' ', '-')
+        attribute_cache = cls.size_color_cache[attribute_id]
+        exist_attr_val = next(
+            v for v in attribute_cache["values"].iterator() if v.name == value
+        )
+
+        if not exist_attr_val:
+            raise ObjectDoesNotExist("attribute with value not exist: " + value)
+
+        return attribute_cache["attribute"], exist_attr_val
+
+    @classmethod
+    def get_default_warehouse(cls):
+        if not cls.def_warehouse_cache:
+            cls.def_warehouse_cache = warehouse_models.Warehouse.objects.get(
+                pk=cls.DEF_WAREHOUSE_ID
+            )
+        return cls.def_warehouse_cache
+
+    @classmethod
+    def create_variants(cls, product, shopify_variants):
+        new_variants = []
+        for variant in shopify_variants:
+            sva = variant.attributes
+            weight = Weight()
+            setattr(weight, sva.get("weight_unit"), sva.get("weight"))
+            new_variant = models.ProductVariant.objects.create(
+                product=product,
+                weight=weight,
+                sku=variant.attributes.get("sku"),
+                price_amount=Decimal(sva.get("price"))
+            )
+
+            size_attr, exist_size = cls.get_attribute_value(
+                cls.DEF_SIZE_ATTRIBUTE_ID, variant.option1
+            )
+            color_attr, exist_color = cls.get_attribute_value(
+                cls.DEF_COLOR_ATTRIBUTE_ID, variant.option2
+            )
+
+            warehouse_models.Stock.objects.create(
+                warehouse=cls.get_default_warehouse(),
+                product_variant=new_variant,
+                quantity=sva.get("inventory_quantity")
+            )
+            associate_attribute_values_to_instance(new_variant, size_attr, exist_size)
+            associate_attribute_values_to_instance(new_variant, color_attr, exist_color)
+            new_variants.append(new_variant)
+
+        return new_variants
+
+    @classmethod
+    def create_color_sizes(cls, shopify_products):
+        size_values = []
+        color_values = []
+        for spd in shopify_products:
+            for variant in spd.attributes["variants"]:
+                if variant.option1 not in size_values:
+                    size_values.append(variant.option1)
+                if variant.option2 not in color_values:
+                    color_values.append(variant.option2)
+
+        cls.create_attribute_values(cls.DEF_SIZE_ATTRIBUTE_ID, size_values)
+        cls.create_attribute_values(cls.DEF_COLOR_ATTRIBUTE_ID, color_values)
+
+    @classmethod
+    def get_product_by_shopify_id(cls, shopify_product_ids):
+        products = models.Product.objects.filter(
+            metadata__shopifyid__in=shopify_product_ids
+        )
+        return products
+
+    @classmethod
+    def create_product_images(cls, products, product_images):
+        for product in products:
+            image_urls = product_images[product.id]
+            create_product_images_from_url.delay(product.id, image_urls)
+
+    @classmethod
+    @transaction.atomic
+    def create_products(cls, shopify_products):
+        def_product_type = models.ProductType.objects.get(pk=cls.DEF_PRODUCT_TYPE_ID)
+        def_category = models.Category.objects.get(pk=cls.DEF_PRODUCT_CATEGORY_ID)
+
+        products = list()
+        product_images = dict()
+        for shopy_product in shopify_products:
+            spa = shopy_product.attributes
+            new_product = models.Product.objects.create(
+                name=spa["title"],
+                slug=slugify(spa["title"] + str(spa["id"])),
+                product_type=def_product_type,
+                category=def_category,
+                description=spa["body_html"],
+                is_published=True,
+                visible_in_listings=True,
+                available_for_purchase=datetime.date.today(),
+                metadata={"shopifyid": str(spa["id"])}
+            )
+
+            cls.create_variants(new_product, spa["variants"])
+            products.append(new_product)
+
+            product_images[new_product.id] = []
+            for image in spa["images"]:
+                product_images[new_product.id].append(image.src)
+
+        return products, product_images
+
+    @classmethod
+    @transaction.atomic
+    def create_collection(cls, shopify_collection, products):
+        all_collections = models.Collection.objects.all()
+        sca = shopify_collection.attributes
+        collection_name = sca["title"]
+        i = 1
+        while True:
+            try:
+                collection = next(filter(
+                    lambda c: c.name == collection_name, all_collections.iterator()
+                ))
+            except StopIteration:
+                collection = None
+
+            if not collection:
+                break
+            i = i + 1
+            collection_name = sca["title"] + "(" + str(i) + ")"
+
+        new_collection = models.Collection.objects.create(
+            name=collection_name,
+            slug=slugify(collection_name),
+            is_published=True,
+            description=sca["body_html"],
+            metadata={"shopifyid": str(sca["collection_id"])}
+        )
+
+        collection_products = []
+        for product in products:
+            new_col_product = models.CollectionProduct(
+                collection=new_collection,
+                product=product
+            )
+            collection_products.append(new_col_product)
+        models.CollectionProduct.objects.bulk_create(collection_products)
+        cls.create_menu_item(new_collection)
+
+    @classmethod
+    def create_menu_item(cls, collection):
+        menu = menu_models.Menu.objects.get(name="navbar")
+        menu_models.MenuItem.objects.create(
+            name=collection.name,
+            menu=menu,
+            collection=collection,
+            parent_id=cls.DEF_MENU_ITEM_ID
+        )
+
+    @classmethod
+    def perform_mutation(cls, root, info, **data):
+        shopify = Shopify(data["shop_url"])
+        collection_id = data["collection_id"]
+        shopify_collection = shopify.get_collection(collection_id)
+        shopify_products = shopify.get_collection_products(collection_id)
+
+        shopify_product_ids = list(map(lambda p: str(p.id), shopify_products))
+        exist_products = cls.get_product_by_shopify_id(shopify_product_ids)
+        exist_product_ids = list(map(lambda p: p.metadata["shopifyid"], exist_products))
+        shopify_products = list(filter(
+            lambda p: str(p.id) not in exist_product_ids, shopify_products
+        ))
+
+        cls.create_color_sizes(shopify_products)
+        products, product_images = cls.create_products(shopify_products)
+        cls.create_collection(shopify_collection, products + list(exist_products))
+        cls.create_product_images(products, product_images)
+
+        return cls(products=products)
 
 
 class ProductBulkDelete(ModelBulkDeleteMutation):
