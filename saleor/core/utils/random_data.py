@@ -313,7 +313,7 @@ def create_products_by_schema(placeholder_dir, create_images):
     path = os.path.join(
         settings.PROJECT_ROOT, "saleor", "static", "populatedb_data.json"
     )
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         db_items = json.load(f)
     types = defaultdict(list)
     # Sort db objects by its model

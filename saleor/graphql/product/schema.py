@@ -27,6 +27,7 @@ from .bulk_mutations.products import (
     ProductVariantStocksCreate,
     ProductVariantStocksDelete,
     ProductVariantStocksUpdate,
+    ProductBulkCreateFromShopify,
 )
 from .enums import StockAvailability
 from .filters import (
@@ -534,3 +535,4 @@ class ProductMutations(graphene.ObjectType):
 
     variant_image_assign = VariantImageAssign.Field()
     variant_image_unassign = VariantImageUnassign.Field()
+    product_bulk_create_from_shopify = ProductBulkCreateFromShopify.Field()
