@@ -2,11 +2,13 @@ import re
 import shopify
 
 from django.core.exceptions import ValidationError, ImproperlyConfigured
+from shopify import ApiVersion, Release
+
 from ...product.error_codes import ProductErrorCode
 
 
 class Shopify:
-    API_VERSION = "2021-04"
+    API_VERSION = "2021-07"
     session = None
 
     def __init__(self, shop_url, access_token):
@@ -21,6 +23,7 @@ class Shopify:
                 "invalid access token", code=ProductErrorCode.INVALID.value,
             )
 
+        ApiVersion.define_version(Release("2021-07"))
         self.session = shopify.Session(shop_url, self.API_VERSION, access_token)
         shopify.ShopifyResource.activate_session(self.session)
 
@@ -45,4 +48,4 @@ class Shopify:
         if not self.session:
             raise ImproperlyConfigured("shopify has not init")
 
-        return shopify.CollectionListing.find(id_=collection_id)
+        return shopify.Collection.find(id_=collection_id)

@@ -200,6 +200,9 @@ class ProductBulkCreateFromShopify(BaseMutation):
         new_variants = []
         new_stocks = []
         for variant in shopify_product.variants:
+            if not (variant.sku and variant.price):
+                continue
+
             weight = Weight()
             setattr(weight, variant.weight_unit, variant.weight)
             new_variant = models.ProductVariant(
@@ -292,7 +295,7 @@ class ProductBulkCreateFromShopify(BaseMutation):
                 slug=slugify(spa.title + str(spa.id)),
                 product_type=def_product_type,
                 category=def_category,
-                description=spa.body_html,
+                description=(spa.body_html if spa.body_html else ""),
                 is_published=True,
                 visible_in_listings=True,
                 available_for_purchase=datetime.date.today(),
@@ -332,8 +335,8 @@ class ProductBulkCreateFromShopify(BaseMutation):
             name=collection_name,
             slug=slugify(collection_name),
             is_published=True,
-            description=shopify_collection.body_html,
-            metadata={"shopifyid": str(shopify_collection.collection_id)}
+            description=str(shopify_collection.body_html),
+            metadata={"shopifyid": str(shopify_collection.id)}
         )
 
         collection_products = []
