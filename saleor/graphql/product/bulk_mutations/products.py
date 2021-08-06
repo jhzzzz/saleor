@@ -17,7 +17,7 @@ from ....product.thumbnails import create_product_images_from_url
 from ....product.utils import delete_categories
 from ....product.utils.attributes import generate_name_for_variant, \
     associate_attribute_values_to_instance
-from ....third.shopify.product import Shopify
+from ....third.shopify import Shopify
 from ....warehouse import models as warehouse_models
 from ....warehouse.error_codes import StockErrorCode
 from ...core.mutations import (
@@ -192,47 +192,75 @@ class ProductBulkCreateFromShopify(BaseMutation):
         return cls.def_warehouse_cache
 
     @classmethod
-    def create_variants(cls, product, shopify_variants):
+    def create_variants(cls, product, shopify_product):
+        size_attr_index, color_attr_index = cls.get_size_color_index(shopify_product)
+        if not (size_attr_index > 0 and color_attr_index > 0):
+            return
+
         new_variants = []
-        for variant in shopify_variants:
-            sva = variant.attributes
+        new_stocks = []
+        for variant in shopify_product.variants:
             weight = Weight()
-            setattr(weight, sva.get("weight_unit"), sva.get("weight"))
-            new_variant = models.ProductVariant.objects.create(
+            setattr(weight, variant.weight_unit, variant.weight)
+            new_variant = models.ProductVariant(
                 product=product,
                 weight=weight,
-                sku=variant.attributes.get("sku"),
-                price_amount=Decimal(sva.get("price"))
+                sku=variant.sku,
+                price_amount=Decimal(variant.price)
             )
 
             size_attr, exist_size = cls.get_attribute_value(
-                cls.DEF_SIZE_ATTRIBUTE_ID, variant.option1
+                cls.DEF_SIZE_ATTRIBUTE_ID,
+                getattr(variant, "option" + str(size_attr_index))
             )
             color_attr, exist_color = cls.get_attribute_value(
-                cls.DEF_COLOR_ATTRIBUTE_ID, variant.option2
+                cls.DEF_COLOR_ATTRIBUTE_ID,
+                getattr(variant, "option" + str(color_attr_index))
             )
 
-            warehouse_models.Stock.objects.create(
+            new_variant.save()
+            new_stock = warehouse_models.Stock(
                 warehouse=cls.get_default_warehouse(),
                 product_variant=new_variant,
-                quantity=sva.get("inventory_quantity")
+                quantity=variant.inventory_quantity
             )
+            new_stocks.append(new_stock)
+
             associate_attribute_values_to_instance(new_variant, size_attr, exist_size)
             associate_attribute_values_to_instance(new_variant, color_attr, exist_color)
             new_variants.append(new_variant)
 
+        warehouse_models.Stock.objects.bulk_create(new_stocks)
         return new_variants
+
+    @classmethod
+    def get_size_color_index(cls, product):
+        size_attr_index = 0
+        color_attr_index = 0
+        for option in product.options:
+            name = option.name.lower()
+            if name == 'color':
+                color_attr_index = option.position
+            elif name == 'size':
+                size_attr_index = option.position
+        return size_attr_index, color_attr_index
 
     @classmethod
     def create_color_sizes(cls, shopify_products):
         size_values = []
         color_values = []
         for spd in shopify_products:
-            for variant in spd.attributes["variants"]:
-                if variant.option1 not in size_values:
-                    size_values.append(variant.option1)
-                if variant.option2 not in color_values:
-                    color_values.append(variant.option2)
+            size_attr_index, color_attr_index = cls.get_size_color_index(spd)
+            if not (size_attr_index > 0 and color_attr_index > 0):
+                continue
+
+            for variant in spd.variants:
+                size_val = getattr(variant, "option" + str(size_attr_index))
+                color_val = getattr(variant, "option" + str(color_attr_index))
+                if not (size_val in size_values):
+                    size_values.append(size_val)
+                if not (color_val in color_values):
+                    color_values.append(color_val)
 
         cls.create_attribute_values(cls.DEF_SIZE_ATTRIBUTE_ID, size_values)
         cls.create_attribute_values(cls.DEF_COLOR_ATTRIBUTE_ID, color_values)
@@ -258,25 +286,24 @@ class ProductBulkCreateFromShopify(BaseMutation):
 
         products = list()
         product_images = dict()
-        for shopy_product in shopify_products:
-            spa = shopy_product.attributes
+        for spa in shopify_products:
             new_product = models.Product.objects.create(
-                name=spa["title"],
-                slug=slugify(spa["title"] + str(spa["id"])),
+                name=spa.title,
+                slug=slugify(spa.title + str(spa.id)),
                 product_type=def_product_type,
                 category=def_category,
-                description=spa["body_html"],
+                description=spa.body_html,
                 is_published=True,
                 visible_in_listings=True,
                 available_for_purchase=datetime.date.today(),
-                metadata={"shopifyid": str(spa["id"])}
+                metadata={"shopifyid": str(spa.id)}
             )
 
-            cls.create_variants(new_product, spa["variants"])
+            cls.create_variants(new_product, spa)
             products.append(new_product)
 
             product_images[new_product.id] = []
-            for image in spa["images"]:
+            for image in spa.images:
                 product_images[new_product.id].append(image.src)
 
         return products, product_images
@@ -285,13 +312,13 @@ class ProductBulkCreateFromShopify(BaseMutation):
     @transaction.atomic
     def create_collection(cls, shopify_collection, products):
         all_collections = models.Collection.objects.all()
-        sca = shopify_collection.attributes
-        collection_name = sca["title"]
+        collection_name = shopify_collection.title
         i = 1
         while True:
             try:
+                lower_collection_name = collection_name.lower()
                 collection = next(filter(
-                    lambda c: c.name == collection_name, all_collections.iterator()
+                    lambda c: c.name.lower() == lower_collection_name, all_collections.iterator()
                 ))
             except StopIteration:
                 collection = None
@@ -299,14 +326,14 @@ class ProductBulkCreateFromShopify(BaseMutation):
             if not collection:
                 break
             i = i + 1
-            collection_name = sca["title"] + "(" + str(i) + ")"
+            collection_name = shopify_collection.title + "(" + str(i) + ")"
 
         new_collection = models.Collection.objects.create(
             name=collection_name,
             slug=slugify(collection_name),
             is_published=True,
-            description=sca["body_html"],
-            metadata={"shopifyid": str(sca["collection_id"])}
+            description=shopify_collection.body_html,
+            metadata={"shopifyid": str(shopify_collection.collection_id)}
         )
 
         collection_products = []
@@ -331,7 +358,7 @@ class ProductBulkCreateFromShopify(BaseMutation):
 
     @classmethod
     def perform_mutation(cls, root, info, **data):
-        shopify = Shopify(data["shop_url"])
+        shopify = Shopify(data["shop_url"], data["access_token"])
         collection_id = data["collection_id"]
         shopify_collection = shopify.get_collection(collection_id)
         shopify_products = shopify.get_collection_products(collection_id)
