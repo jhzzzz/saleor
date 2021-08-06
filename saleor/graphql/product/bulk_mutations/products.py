@@ -200,8 +200,10 @@ class ProductBulkCreateFromShopify(BaseMutation):
         new_variants = []
         new_stocks = []
         for variant in shopify_product.variants:
-            if not (variant.sku and variant.price):
-                continue
+            if not variant.sku:
+                variant.sku = str(product.id) + "_" + \
+                              variant.option1.replace(" ", "_") + "_" + \
+                              variant.option2.replace(" ", "_")
 
             weight = Weight()
             setattr(weight, variant.weight_unit, variant.weight)
